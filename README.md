@@ -8,8 +8,9 @@ Binlerce öğrenciye aynı anda hizmet verebilmek için tasarlanmış, **Yüksek
 1. [Sistem Mimarisi](#sistem-mimarisi)
 2. [Bölüm 1: Moodle Uygulama Sunucularının Kurulumu](#bölüm-1-moodle-uygulama-sunucularının-kurulumu)
 3. [Bölüm 2: HAProxy ile Yük Dengeleme](#bölüm-2-haproxy-ile-yük-dengeleme)
-4. [Bölüm 3: Scalelite ve BigBlueButton Kümesi](#bölüm-3-scalelite-ve-bigbluebutton-kümesi)
-5. [Sorun Giderme İpuçları](#sorun-giderme-ipuçları)
+4. [Bölüm 3: PostgreSQL Kurulumu ve PgBouncer ile SQL Yük Dengeleme](#bölüm-3-postgresql-kurulumu-ve-pgbouncer-ile-sql-yük-dengeleme)
+5. [Bölüm 4: Scalelite ve BigBlueButton Kümesi](#bölüm-4-scalelite-ve-bigbluebutton-kümesi)
+6. [Sorun Giderme İpuçları](#sorun-giderme-ipuçları)
 
 ---
 
@@ -38,23 +39,32 @@ Binlerce öğrenciye aynı anda hizmet verebilmek için tasarlanmış, **Yüksek
                   │
         ┌─────────┼──────────┐
         ▼         ▼          ▼
-    ┌────────┐ ┌────────┐ ┌────────┐
-    │PostgreSQL │ Redis  │  NFS    │
-    │Veritabanı │Session │ Dosyalar│
-    │192.168.1.100│192.168.1.185│192.168.1.50│
-    └────────┘ └────────┘ └────────┘
+    ┌──────────┐ ┌────────┐ ┌────────┐
+    │PgBouncer │ │ Redis  │ │  NFS   │
+    │(SQL Bal.)│ │Session │ │Dosyalar│
+    │192.168.1.│ │192.168.│ │192.168.│
+    │101 :6432 │ │1.185   │ │1.50    │
+    └──────────┘ └────────┘ └────────┘
+         │
+    ┌────┴──────────┐
+    ▼               ▼
+┌──────────┐  ┌──────────┐
+│PostgreSQL│  │PostgreSQL│  (Primary + Replica)
+│Primary   │  │Replica   │
+│192.168.  │  │192.168.  │
+│1.100     │  │1.101     │
+└──────────┘  └──────────┘
 
-┌─────────────────────────────────────────────┐
-│ Canlı Dersler (BigBlueButton Kümesi)       │
-├─────────────────────────────────────────────┤
-│  Scalelite Yük Dengeleyici                  │
-│  (192.168.1.60)                             │
-│         │                                    │
-│    ┌────┴────┬─────────┐                   │
-│    ▼         ▼         ▼                   │
-│  BBB-1    BBB-2    BBB-N   ... N adet BBB │
-│  Node     Node     Node      Sunucusu      │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│ Canlı Dersler (BigBlueButton Kümesi)   │
+├─────────────────────────────────────────┤
+│  Scalelite Yük Dengeleyici              │
+│  (192.168.1.60)                         │
+│         │                               │
+│    ┌────┴────┬─────────┐               │
+│    ▼         ▼         ▼               │
+│  BBB-1    BBB-2    BBB-N               │
+└─────────────────────────────────────────┘
 ```
 
 ### 🖥️ Bileşen Özeti
@@ -63,11 +73,13 @@ Binlerce öğrenciye aynı anda hizmet verebilmek için tasarlanmış, **Yüksek
 |---------|------|-------|----------|
 | **HAProxy** | 1 | SSL Sonlandırması, Trafik Dağıtımı | 192.168.1.10 |
 | **Moodle Node** | 10 | Eğitim Platformu (Nginx + PHP) | 192.168.1.11-20 |
-| **PostgreSQL** | 1 | Veritabanı | 192.168.1.100 |
+| **PostgreSQL Primary** | 1 | Ana Veritabanı (Yazma) | 192.168.1.100 |
+| **PostgreSQL Replica** | 1 | Okuma Replikası (Opsiyonel) | 192.168.1.101 |
+| **PgBouncer** | 1 | SQL Bağlantı Havuzu / Yük Dengeleme | 192.168.1.100 :6432 |
 | **Redis** | 1 | Oturum ve Önbellek | 192.168.1.185 |
-| **NFS**(vm) | 1 | Ortak Dosya Depolama | 192.168.1.50 |
+| **NFS** | 1 | Ortak Dosya Depolama | 192.168.1.50 |
 | **Scalelite** | 1 | BBB Yük Dengeleyici | 192.168.1.60 |
-| **BigBlueButton**(vm) | N | Canlı Ders Sunucuları | 192.168.1.70+ |
+| **BigBlueButton** | N | Canlı Ders Sunucuları | 192.168.1.70+ |
 
 ---
 
@@ -120,45 +132,15 @@ sudo apt install -y \
 
 ### 2️⃣ NFS Bağlantısının Yapılandırılması
 
-Moodle'ın tüm sunucularda aynı dosyalara (ödevler, kütüphane vb.) erişebilmesi için NFS kullanıyoruz.
-
 ```bash
-# NFS bağlanacak klasörü oluştur
 sudo mkdir -p /var/moodledata
-
-# NFS sunucusunu bağla
-# ⚠️ 192.168.1.50 kısmını kendi NFS sunucunuzun IP'si ile değiştirin
 sudo mount 192.168.1.50:/export/moodledata /var/moodledata
-
-# Sunucu yeniden başlatılsa da otomatik bağlansın diye fstab dosyasına ekle
 echo "192.168.1.50:/export/moodledata /var/moodledata nfs defaults,_netdev 0 0" | \
   sudo tee -a /etc/fstab
-```
 
-**Güvenlik Ayarlaması (KRITIK):**
-
-Moodle web sunucusu (www-data kullanıcısı) bu klasöre yazabilir olmalıdır:
-
-```bash
-# Klasöre www-data sahipliğini ver
 sudo chown -R www-data:www-data /var/moodledata
-
-# Uygun izinleri ayarla
 sudo chmod -R 755 /var/moodledata
-
-# İzinleri doğrula
 ls -ld /var/moodledata
-# Çıktı: drwxr-xr-x 3 www-data www-data şeklinde olmalı
-```
-
-**NFS bağlantısını test et:**
-```bash
-# NFS bağlı mı kontrol et
-df -h | grep moodledata
-# Test dosyası oluştur
-sudo -u www-data touch /var/moodledata/test.txt
-# Başarılı olursa klasörden sil
-sudo -u www-data rm /var/moodledata/test.txt
 ```
 
 ---
@@ -166,16 +148,10 @@ sudo -u www-data rm /var/moodledata/test.txt
 ### 3️⃣ Moodle Kodlarının Hazırlanması
 
 ```bash
-# Moodle için klasör oluştur
 sudo mkdir -p /var/www/moodle
-
-# Moodle kodlarını indir (resmi kaynaktan)
-# Not: İlk kurulumda Moodle'ı git ile klonlayabilir veya indirilen dosyaları kopyalayabilirsiniz
 cd /tmp
 git clone https://github.com/moodle/moodle.git --depth 1 --branch MOODLE_401_STABLE
 sudo cp -r moodle/* /var/www/moodle/
-
-# Moodle dizininin sahibini ayarla
 sudo chown -R www-data:www-data /var/www/moodle
 sudo chmod -R 755 /var/www/moodle
 ```
@@ -184,229 +160,126 @@ sudo chmod -R 755 /var/www/moodle
 
 ### 4️⃣ Moodle Konfigürasyon Dosyası (config.php)
 
-Kümelenmiş mimaride çalışmak için özel bir config.php dosyası oluşturmalıyız:
-
 ```bash
 sudo nano /var/www/moodle/config.php
 ```
 
-Aşağıdaki içeriği dosyaya yapıştırın (IP adreslerini kendi ağınıza göre düzenleyin):
-
 ```php
 <?php
-// ============================================================================
-// Moodle Yüksek Erişilebilirlik (HA) Kümesi Konfigürasyonu
-// ============================================================================
-
 unset($CFG);
 global $CFG;
 $CFG = new stdClass();
 
-// ============================================================================
-// 1. VERITABANI AYARLARI (Ortak PostgreSQL Sunucusu)
-// ============================================================================
-$CFG->dbtype    = 'pgsql';           // Veritabanı türü
-$CFG->dblibrary = 'native';          // Native PostgreSQL sürücüsü
-$CFG->dbhost    = '192.168.1.100';   // ⚠️ PostgreSQL sunucusu IP'sini yazın
-$CFG->dbname    = 'moodle';          // Veritabanı adı
-$CFG->dbuser    = 'moodleuser';      // Veritabanı kullanıcısı
-$CFG->dbpass    = 'VERITABANI_SIFRENIZ'; // ⚠️ Güvenli şifre belirleyin
-$CFG->prefix    = 'mdl_';            // Tablo ön eki
+// 1. VERITABANI AYARLARI
+// ⚠️ PgBouncer üzerinden bağlanıyoruz (port 6432)
+$CFG->dbtype    = 'pgsql';
+$CFG->dblibrary = 'native';
+$CFG->dbhost    = '192.168.1.100';   // PgBouncer IP
+$CFG->dbport    = '6432';            // PgBouncer portu (PostgreSQL default 5432 değil!)
+$CFG->dbname    = 'moodle';
+$CFG->dbuser    = 'moodleuser';
+$CFG->dbpass    = 'VERITABANI_SIFRENIZ';
+$CFG->prefix    = 'mdl_';
 
-// ============================================================================
 // 2. WEB VE KLASÖR AYARLARI
-// ============================================================================
-$CFG->wwwroot   = 'https://moodle.argeyazilim.tr'; // ⚠️ Kendi domain'inizi yazın
-$CFG->dataroot  = '/var/moodledata';  // NFS'ten gelen ortak klasör
-$CFG->admin     = 'admin';            // Admin paneli URL'i
-$CFG->directorypermissions = 0770;    // Klasör izinleri
+$CFG->wwwroot   = 'https://moodle.argeyazilim.tr';
+$CFG->dataroot  = '/var/moodledata';
+$CFG->admin     = 'admin';
+$CFG->directorypermissions = 0770;
 
-// ============================================================================
-// 3. REVERSE PROXY AYARLARI (HAProxy Arkasında Olmak İçin)
-// ============================================================================
-// HAProxy HTTPS bağlantısını HTTP'ye çevirdiği için bunu belirtmemiz gerekir
-$CFG->sslproxy = true;        // HAProxy'nin SSL sonlandırmasını kabullen
-$CFG->reverseproxy = true;    // Reverse proxy arkasında olduğumuzu söyle
+// 3. REVERSE PROXY AYARLARI
+$CFG->sslproxy = true;
+$CFG->reverseproxy = true;
 
-// ============================================================================
-// 4. OTURUM YÖNETİMİ (Redis Kullanarak - Tüm Sunucularda Aynı)
-// ============================================================================
-// Kullanıcıların oturumu kapatılmaması için oturum bilgileri merkezi Redis'te tutulur
+// 4. OTURUM YÖNETİMİ (Redis)
 $CFG->session_handler_class = '\core\session\redis';
-$CFG->session_redis_host = '192.168.1.185';      // ⚠️ Redis sunucusu IP'sini yazın
-$CFG->session_redis_port = 6379;                 // Redis port
-$CFG->session_redis_auth = 'REDIS_SIFRENIZ';     // ⚠️ Redis şifresi (varsa)
-$CFG->session_redis_prefix = 'moodle_session_';  // Oturum ön eki
-$CFG->session_redis_acquire_lock_timeout = 120;  // Kilit bekleme süresi
-$CFG->session_redis_lock_expire = 7200;          // Kilit süresi (2 saat)
+$CFG->session_redis_host = '192.168.1.185';
+$CFG->session_redis_port = 6379;
+$CFG->session_redis_auth = 'REDIS_SIFRENIZ';
+$CFG->session_redis_prefix = 'moodle_session_';
+$CFG->session_redis_acquire_lock_timeout = 120;
+$CFG->session_redis_lock_expire = 7200;
 
-// ============================================================================
-// 5. ÖNBELLEK YÖNETİMİ (İsteğe Bağlı - Performans için)
-// ============================================================================
-// $CFG->cachestore_redis_server = '192.168.1.185:6379';
-// $CFG->cachestore_redis_auth = 'REDIS_SIFRENIZ';
-
-// ============================================================================
-// 6. İLETİŞİM AYARLARI (E-posta)
-// ============================================================================
-$CFG->smtphosts = 'smtp.example.com:25';  // ⚠️ SMTP sunucunuzu yazın
+// 5. İLETİŞİM AYARLARI
+$CFG->smtphosts = 'smtp.example.com:25';
 $CFG->noreplyaddress = 'noreply@moodle.argeyazilim.tr';
 $CFG->supportemail = 'support@argeyazilim.tr';
 
-// ============================================================================
-// 7. GÜVENLİK AYARLARI
-// ============================================================================
-// Sadece HTTPS ile erişime izin ver
-$CFG->disableupdatenotifications = true; // İç ağda olduğu için güncelleme bildirimleri kapat
+// 6. GÜVENLİK AYARLARI
+$CFG->disableupdatenotifications = true;
 
-// ============================================================================
-// 8. DEBUG AYARLARI (Üretim Ortamında Kapalı Kalmalı)
-// ============================================================================
-$CFG->debug = DEBUG_NONE;  // Üretim ortamında sorunları tespit etmek için ERROR'a değiştirebilirsiniz
+// 7. DEBUG (Üretimde kapalı)
+$CFG->debug = DEBUG_NONE;
 $CFG->debugdisplay = false;
-$CFG->debugstringids = false;
 
-// Moodle kurulum dosyasını başlat
 require_once(__DIR__ . '/lib/setup.php');
-
-// Kurulum bitişinde bu satırı açın (Kurulum sonrası)
-// require_once(__DIR__ . '/lib/setup.php');
 ```
 
 ---
 
 ### 5️⃣ Nginx Konfigürasyonu
 
-HAProxy HAProxy arkasında çalıştığı için, Nginx sadece port 80'de (HTTP) dinleyecektir. SSL (HTTPS) şifrelemesi HAProxy tarafından yapılır.
-
 ```bash
 sudo nano /etc/nginx/sites-available/moodle
 ```
 
-Aşağıdaki konfigürasyonu yapıştırın:
-
 ```nginx
-# Moodle Sunucusu Konfigürasyonu
 server {
-    # Port 80'de dinle (HAProxy'den trafik gelecek)
     listen 80 default_server;
     listen [::]:80 default_server;
-    
-    # Domain adı
     server_name moodle.argeyazilim.tr _;
-    
-    # Moodle klasörü
     root /var/www/moodle;
     index index.php;
-    
-    # Geniş dosya yükleme desteği (100MB'ye kadar)
     client_max_body_size 100M;
-    
-    # ============================================================================
-    # HAProxy'den Gelen Gerçek IP'yi Almak (Logging için)
-    # ============================================================================
-    # Not: HAProxy IP'sini yazın (Ör: 192.168.1.10)
+
     set_real_ip_from 192.168.1.10;
     real_ip_header X-Forwarded-For;
-    
-    # ============================================================================
-    # Tüm İstekler
-    # ============================================================================
+
     location / {
         try_files $uri $uri/ /index.php?$query_string;
     }
-    
-    # ============================================================================
-    # PHP Dosyaları (index.php gibi)
-    # ============================================================================
+
     location ~ [^/]\.php(/|$) {
-        # FastCGI yapılandırması
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:/run/php/php8.3-fpm.sock;
-        
-        # Script dosyasının tam yolunu ilet
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        
-        # HAProxy'den gelen bilgileri PHP'ye ilet
         fastcgi_param HTTP_X_FORWARDED_FOR $proxy_add_x_forwarded_for;
         fastcgi_param HTTP_X_FORWARDED_PROTO $http_x_forwarded_proto;
-        
-        # Zaman aşımı ayarları (büyük dosyalar için)
         fastcgi_connect_timeout 60s;
         fastcgi_send_timeout 300s;
         fastcgi_read_timeout 300s;
-        
         include fastcgi_params;
     }
-    
-    # ============================================================================
-    # Gizli Dosyalara Erişimi Engelle
-    # ============================================================================
-    # .htaccess dosyalarına erişim istemeyin
-    location ~ /\.ht {
-        deny all;
-    }
-    
-    # .env dosyasına erişim engelle
-    location ~ /\.env {
-        deny all;
-    }
-    
-    # Moodle'ın private dosyalarına erişim engelle
-    location ~ ^/\.git {
-        deny all;
-    }
+
+    location ~ /\.ht { deny all; }
+    location ~ /\.env { deny all; }
+    location ~ ^/\.git { deny all; }
 }
 ```
 
-Konfigürasyonu etkinleştir:
-
 ```bash
-# Konfigürasyonu sites-enabled klasörüne bağla
 sudo ln -s /etc/nginx/sites-available/moodle /etc/nginx/sites-enabled/
-
-# Varsayılan konfigürasyonu devre dışı bırak (sorun yaratabilir)
 sudo rm /etc/nginx/sites-enabled/default 2>/dev/null || true
-
-# Syntax kontrolü yap
 sudo nginx -t
-# Çıktı: "test is successful" görmelisiniz
-
-# Nginx'i yeniden başlat
 sudo systemctl restart nginx
-sudo systemctl enable nginx  # Önyükleme sırasında otomatik başlat
+sudo systemctl enable nginx
 ```
 
 ---
 
 ### 6️⃣ PHP-FPM Ayarlaması
 
-PHP'nin optimum performans sunması için ayarları yapılandır:
-
 ```bash
 sudo nano /etc/php/8.3/fpm/php.ini
 ```
 
-Aşağıdaki satırları bulup değiştir:
-
 ```ini
-; Dosya yükleme limiti
 upload_max_filesize = 100M
-
-; POST veri limiti
 post_max_size = 100M
-
-; Maksimum yürütme süresi
 max_execution_time = 300
-
-; Bellek limiti
 memory_limit = 256M
-
-; Zaman dilimi
 date.timezone = Europe/Istanbul
 ```
-
-PHP-FPM'i yeniden başlat:
 
 ```bash
 sudo systemctl restart php8.3-fpm
@@ -414,81 +287,39 @@ sudo systemctl restart php8.3-fpm
 
 ---
 
-### 7️⃣ Cron Görevi Ayarı (ÖNEMLİ: Sadece Node-1'de)
-
-Moodle, cron görevi aracılığıyla veritabanını günceller ve e-postaları gönderir. **Kümelenmiş mimaride bu görev SADECE bir sunucuda çalışmalıdır** (aksi takdirde e-postalar birden fazla gönderilir).
-
-**SADECE Node-1 (Master Node) üzerinde:**
+### 7️⃣ Cron Görevi (SADECE Node-1'de)
 
 ```bash
-# www-data kullanıcısı için crontab'ı aç
 sudo crontab -u www-data -e
-
-# Aşağıdaki satırı ekle (dakikada bir çalışması için):
-```
-
-```bash
+# Şu satırı ekle:
 * * * * * /usr/bin/php /var/www/moodle/admin/cli/cron.php >/dev/null 2>&1
 ```
 
-**Diğer 9 sunucuda (Node-2 ile Node-10) cron görevi oluşturmayın!**
+**Diğer 9 sunucuda cron görevi oluşturmayın!**
 
 ---
 
-### 8️⃣ Moodle Kurulumunu Tamamlama
-
-Node-1'de Moodle veritabanını initialize et:
+### 8️⃣ Moodle Veritabanını Başlatma
 
 ```bash
-# Moodle komut dosyasını çalıştır
 sudo -u www-data php /var/www/moodle/admin/cli/install_database.php \
   --lang=tr \
   --adminpass=GUCLU_YONETİCİ_SIFRENIZ \
   --agree-license
 ```
 
-Kurulum başarılı olursa, tarayıcıdan `http://192.168.1.11` (Node-1'in IP'si) adresine gittiğinizde Moodle anasayfasını görebilirsiniz.
-
 ---
 
 ### 9️⃣ Yapılandırmayı Diğer Sunuculara Kopyalama
 
-Node-1 başarıyla kurulduktan sonra, Node-2'den Node-10'a kadar olan sunucularda aynı adımları takip edin, ancak veritabanı kurulumu yapmanız yeterli değil - aşağıdaki adımları yapın:
-
-**Her sunucuda (Node-2 ile Node-10):**
-
 ```bash
-# 1. Gerekli yazılımları kur (1. adım)
-# 2. NFS'i bağla (2. adım)
-# 3. Moodle kodlarını kopyala (3. adım)
-# 4. config.php dosyasını kopyala (4. adım)
-# 5. Nginx konfigürasyonunu kopyala (5. adım)
-# 6. PHP ayarlarını kopyala (6. adım)
-
-# NOT: 7. adımda (Cron) hiçbir şey yapmayın!
-
-# Test et
-curl http://192.168.1.12/login/index.php
-```
-
----
-
-### 🟣 Node-1'den Diğer Sunuculara Kopyalama (İsteğe Bağlı Hızlı Yöntem)
-
-Eğer Node-1'de her şey hazırsa, aşağıdaki komutu Node-1'de çalıştırarak konfigürasyonları Node-2 ile Node-10'a kopyalayabilirsiniz:
-
-```bash
-# Node-1'den diğer sunuculara config dosyalarını kopyala (SSH gerekli)
 for i in {2..10}; do
   NODE_IP="192.168.1.$((10 + i))"
   echo "Node-$i'e kopyalanıyor ($NODE_IP)..."
-  
   scp /var/www/moodle/config.php root@$NODE_IP:/var/www/moodle/
   scp /etc/nginx/sites-available/moodle root@$NODE_IP:/etc/nginx/sites-available/
-  
   ssh root@$NODE_IP "systemctl restart nginx"
 done
-
 echo "Tüm sunucular güncellendi!"
 ```
 
@@ -496,86 +327,42 @@ echo "Tüm sunucular güncellendi!"
 
 ## 📌 Bölüm 2: HAProxy ile Yük Dengeleme ve SSL Sonlandırma
 
-**Amaç:** İnternet'ten gelen HTTPS trafiğini karşılayıp, arkadaki Moodle sunucularına HTTP olarak dağıtmak.
-
----
-
 ### 1️⃣ HAProxy Kurulumu
 
-HAProxy sunucusuna SSH ile bağlan ve kur:
-
 ```bash
-# Sistem paketlerini güncelle
 sudo apt update && sudo apt upgrade -y
-
-# HAProxy'i kur
 sudo apt install -y haproxy
-
-# Sürümü kontrol et
 haproxy -v
-# Minimum v2.2 olmalı
 ```
 
 ---
 
 ### 2️⃣ SSL Sertifikasının Hazırlanması
 
-**Seçenek A: Let's Encrypt'ten Sertifika Alıyorsanız**
-
 ```bash
-# Certbot ve Nginx eklentisini kur
 sudo apt install -y certbot python3-certbot-nginx
-
-# Sertifika al
 sudo certbot certonly --standalone \
   -d moodle.argeyazilim.tr \
-  -d www.moodle.argeyazilim.tr \
   --email your@email.com \
   --agree-tos
-```
 
-**Seçenek B: Sertifikayı Zaten Aldıysanız**
-
-Sertifika ve özel anahtarı birleştir:
-
-```bash
-# HAProxy için sertifika klasörü oluştur
 sudo mkdir -p /etc/haproxy/certs
-
-# Sertifika ve özel anahtarı birleştir
-# ⚠️ Dosya yollarını kendi sertifikalarınızla değiştirin
 sudo bash -c 'cat /etc/letsencrypt/live/moodle.argeyazilim.tr/fullchain.pem \
   /etc/letsencrypt/live/moodle.argeyazilim.tr/privkey.pem > \
   /etc/haproxy/certs/moodle.argeyazilim.tr.pem'
-
-# Sertifika izinlerini ayarla (sadece root okuyabilir)
 sudo chmod 600 /etc/haproxy/certs/moodle.argeyazilim.tr.pem
-
-# Sertifikanın geçerli olup olmadığını kontrol et
-sudo openssl x509 -in /etc/haproxy/certs/moodle.argeyazilim.tr.pem -text -noout | grep -A 2 "Validity"
 ```
 
 ---
 
 ### 3️⃣ HAProxy Konfigürasyonu
 
-HAProxy'nin ana yapılandırma dosyasını düzenle:
-
 ```bash
-# Yedek kopyasını al
 sudo cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak
-
-# Dosyayı aç
 sudo nano /etc/haproxy/haproxy.cfg
 ```
 
-**Eski içeriği silin ve aşağıdakini yapıştırın:**
-
 ```haproxy
-# ============================================================================
-# HAProxy Konfigürasyonu - Moodle Yüksek Erişilebilirlik
-# ============================================================================
-
 global
     log /dev/log local0
     log /dev/log local1 notice
@@ -585,22 +372,10 @@ global
     user haproxy
     group haproxy
     daemon
-    
-    # Maksimum bağlantı sayısı
     maxconn 4096
-    
-    # ============================================================================
-    # Modern SSL/TLS Ayarları (Güvenlik İçin)
-    # ============================================================================
-    # Güvenli şifreler (eski ve zayıf şifreleri engelle)
     ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
-    
-    # Eski SSL/TLS versiyonlarını devre dışı bırak
     ssl-default-bind-options no-sslv3 no-tlsv10 no-tlsv11 no-tls-tickets
 
-# ============================================================================
-# VARSAYILAN AYARLAR
-# ============================================================================
 defaults
     log     global
     mode    http
@@ -615,65 +390,27 @@ defaults
     errorfile 503 /etc/haproxy/errors/503.http
     errorfile 504 /etc/haproxy/errors/504.http
 
-# ============================================================================
-# 1. HTTP İsteklerini HTTPS'e Yönlendir (Port 80)
-# ============================================================================
 frontend http_front
     bind *:80
     mode http
-    
-    # Tüm HTTP isteklerini HTTPS'e zorla
-    # Ör: http://moodle.argeyazilim.tr → https://moodle.argeyazilim.tr
     redirect scheme https code 301 if !{ ssl_fc }
 
-# ============================================================================
-# 2. HTTPS Trafiğini Karşıla (Port 443)
-# ============================================================================
 frontend https_front
     bind *:443 ssl crt /etc/haproxy/certs/moodle.argeyazilim.tr.pem
     mode http
-    
-    # Gelen trafiğin gerçek kaynağını izle
     option forwardfor
-    
-    # Moodle'a iletmesi gereken başlık bilgileri
     http-request set-header X-Forwarded-Proto https
     http-request set-header X-Forwarded-Port 443
-    
-    # Tüm trafiği moodle_cluster backend'ine yönlendir
     default_backend moodle_cluster
 
-# ============================================================================
-# 3. MOODLE SUNUCULARI (Backend)
-# ============================================================================
 backend moodle_cluster
     mode http
-    
-    # ============================================================================
-    # Yük Dağıtım Algoritması
-    # ============================================================================
-    # leastconn: En az bağlantısı olan sunucuya gönder (önerilen)
-    # roundrobin: Sırasıyla dağıt
     balance leastconn
-    
-    # Moodle sunucularına iletmesi gereken başlık bilgileri
     option forwardfor
     http-request set-header X-Real-IP %[src]
-    
-    # ============================================================================
-    # Sağlık Kontrolü (Health Check)
-    # ============================================================================
-    # Her 2 saniyede bir sunucuların sağlığını kontrol et
     option httpchk GET /login/index.php HTTP/1.0
     http-check expect status 200
-    
-    # Sunucu ayakta kalma parametreleri
     default-server inter 2000 fall 3 rise 2
-    
-    # ============================================================================
-    # 10 Adet Moodle Sunucusu
-    # ============================================================================
-    # ⚠️ IP adreslerini kendi ağınızla değiştirin
     server moodle-node-01 192.168.1.11:80 check
     server moodle-node-02 192.168.1.12:80 check
     server moodle-node-03 192.168.1.13:80 check
@@ -685,10 +422,6 @@ backend moodle_cluster
     server moodle-node-09 192.168.1.19:80 check
     server moodle-node-10 192.168.1.20:80 check
 
-# ============================================================================
-# 4. İSTATİSTİK PANELİ (İsteğe Bağlı - Önerilir)
-# ============================================================================
-# HAProxy'nin web tabanlı yönetim paneli
 listen stats
     bind *:8404
     stats enable
@@ -698,87 +431,591 @@ listen stats
     mode http
 ```
 
----
-
-### 4️⃣ HAProxy Yapılandırmasını Test ve Başlatma
-
 ```bash
-# Syntax kontrol
 sudo haproxy -c -f /etc/haproxy/haproxy.cfg
-# Çıktı: "Configuration file is valid" görmelisiniz
-
-# Yapılandırma geçerliyse servisi yeniden başlat
 sudo systemctl restart haproxy
-sudo systemctl status haproxy
-
-# Önyükleme sırasında otomatik başlat
 sudo systemctl enable haproxy
 ```
 
 ---
 
-### 5️⃣ HAProxy'i Test Etme
+## 📌 Bölüm 3: PostgreSQL Kurulumu ve PgBouncer ile SQL Yük Dengeleme
 
-**Test 1: Basit bağlantı testi**
-```bash
-# HAProxy sunucusundan test et
-curl -I http://localhost
-# Çıktı: HTTP/1.1 301 (HTTPS yönlendirmesi)
+Bu bölümde PostgreSQL veritabanı sunucusunu sıfırdan kuracağız. Ardından **PgBouncer** bağlantı havuzlayıcısını kurarak 10 Moodle sunucusunun yüzlerce eşzamanlı bağlantısını verimli şekilde yöneteceğiz.
 
-curl -I https://localhost -k
-# Çıktı: HTTP/1.1 302 (Moodle yönlendirmesi)
+**Neden PgBouncer?**
+PostgreSQL her bağlantı için ayrı bir süreç oluşturur; bu maliyetlidir. 10 Moodle sunucusu × her sunucuda çok sayıda PHP worker = binlerce eş zamanlı bağlantı. PgBouncer bu bağlantıları havuzlayarak PostgreSQL'e çok daha az bağlantı gönderir.
+
 ```
-
-**Test 2: İstatistik Panelini Kontrol Et**
-
-Tarayıcıdan açın:
-```
-http://HAPROXY_IP_ADRESI:8404/haproxy_stats
-```
-
-Kullanıcı adı: `admin`
-Şifre: HAProxy konfigürasyonunda belirlediğiniz şifre
-
-Panel'de 10 sunucunun tümü yeşil (UP) olmalıdır.
-
-**Test 3: Son kullanıcı testi**
-
-Tarayıcıdan açın:
-```
-https://moodle.argeyazilim.tr
+Moodle Sunucuları (10x)          PgBouncer          PostgreSQL
+  Node-1  ──┐                  ┌──────────┐        ┌──────────┐
+  Node-2  ──┤ ~1000 bağlantı  │          │ ~50    │          │
+  ...     ──┼────────────────▶️│ Havuz    │───────▶️│ Primary  │
+  Node-10 ──┘                  │ :6432    │        │ :5432    │
+                                └──────────┘        └──────────┘
 ```
 
 ---
 
-## 📌 Bölüm 3: Scalelite ve BigBlueButton Kümesi
+### 1️⃣ PostgreSQL Kurulumu (Primary Sunucu: 192.168.1.100)
 
-Canlı dersler (video konferans) için binlerce öğrenciye eşzamanlı hizmet vermek üzere BigBlueButton sunucularını bir havuzda yönetiyoruz.
+#### 1.1 PostgreSQL'i Kur
 
-**Not:** Bu bölüm ileri seviye bir kurulumun ön bilgisini gerektirir. Detaylı talimatları için [Scalelite Resmi Dokümantasyonu](https://github.com/blindsidenetworks/scalelite)nu inceleyiniz.
+```bash
+# Sistem paketlerini güncelle
+sudo apt update && sudo apt upgrade -y
+
+# PostgreSQL resmi deposunu ekle (güncel sürüm için)
+sudo apt install -y curl ca-certificates gnupg
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | \
+  sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
+
+echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | \
+  sudo tee /etc/apt/sources.list.d/pgdg.list
+
+sudo apt update
+
+# PostgreSQL 16'yı kur
+sudo apt install -y postgresql-16 postgresql-client-16 postgresql-contrib-16
+
+# Servis durumunu kontrol et
+sudo systemctl status postgresql
+# "active (running)" görmelisiniz
+
+# Sürümü kontrol et
+psql --version
+```
+
+#### 1.2 PostgreSQL'i Başlangıçta Başlat
+
+```bash
+sudo systemctl enable postgresql
+sudo systemctl start postgresql
+```
 
 ---
 
-### 1️⃣ Scalelite İçin NFS Ayarı (Kayıt Depolama)
-
-Scalelite sunucusunda:
+### 2️⃣ Veritabanı ve Kullanıcı Oluşturma
 
 ```bash
-# Kayıt klasörlerini oluştur
+# PostgreSQL yönetici hesabına geç
+sudo -u postgres psql
+```
+
+PostgreSQL komut isteminde aşağıdaki SQL komutlarını çalıştır:
+
+```sql
+-- Moodle için güçlü bir şifre ile kullanıcı oluştur
+-- ⚠️ 'VERITABANI_SIFRENIZ' kısmını güçlü bir şifreyle değiştirin
+CREATE USER moodleuser WITH PASSWORD 'VERITABANI_SIFRENIZ';
+
+-- Moodle veritabanını oluştur
+-- UTF8 karakter seti Moodle için zorunludur
+CREATE DATABASE moodle
+    WITH OWNER = moodleuser
+    ENCODING = 'UTF8'
+    LC_COLLATE = 'tr_TR.UTF-8'
+    LC_CTYPE = 'tr_TR.UTF-8'
+    TEMPLATE = template0;
+
+-- Kullanıcıya veritabanı üzerinde tam yetki ver
+GRANT ALL PRIVILEGES ON DATABASE moodle TO moodleuser;
+
+-- Scalelite için ayrı veritabanı ve kullanıcı (Bölüm 4 için)
+CREATE USER scalelite WITH PASSWORD 'SCALELITE_SIFRENIZ';
+CREATE DATABASE scalelite_production
+    WITH OWNER = scalelite
+    ENCODING = 'UTF8'
+    LC_COLLATE = 'tr_TR.UTF-8'
+    LC_CTYPE = 'tr_TR.UTF-8'
+    TEMPLATE = template0;
+GRANT ALL PRIVILEGES ON DATABASE scalelite_production TO scalelite;
+
+-- Oluşturulanları listele
+\l
+
+-- Çıkış
+\q
+```
+
+**Türkçe locale yoksa** (`tr_TR.UTF-8` hatası alırsanız):
+
+```bash
+# PostgreSQL dışında, sistem terminalinde:
+sudo locale-gen tr_TR.UTF-8
+sudo update-locale
+
+# PostgreSQL'i yeniden başlat
+sudo systemctl restart postgresql
+
+# Tekrar dene
+sudo -u postgres psql
+```
+
+---
+
+### 3️⃣ PostgreSQL Ağ Erişim Ayarları
+
+PostgreSQL varsayılan olarak sadece `localhost`'tan bağlantı kabul eder. Moodle sunucularının bağlanabilmesi için bu ayarı değiştirmeliyiz.
+
+#### 3.1 Dinleme Adresini Ayarla
+
+```bash
+sudo nano /etc/postgresql/16/main/postgresql.conf
+```
+
+Şu satırı bulup değiştir:
+
+```ini
+# Eski:
+#listen_addresses = 'localhost'
+
+# Yeni (tüm arayüzlerde dinle):
+listen_addresses = '*'
+```
+
+Aynı dosyada performans ayarlarını da düzenle:
+
+```ini
+# Bağlantı limiti (PgBouncer ile 100 yeterli)
+max_connections = 200
+
+# Bellek ayarları (sunucu RAM'inin %25'i önerilir)
+# 8GB RAM için:
+shared_buffers = 2GB
+effective_cache_size = 6GB
+work_mem = 64MB
+maintenance_work_mem = 512MB
+
+# WAL (Write-Ahead Log) ayarları
+wal_level = replica          # Replikasyon için (opsiyonel)
+max_wal_senders = 3          # Replikasyon bağlantıları
+wal_keep_size = 1GB
+
+# Zaman dilimi
+timezone = 'Europe/Istanbul'
+log_timezone = 'Europe/Istanbul'
+```
+
+#### 3.2 İstemci Kimlik Doğrulama (pg_hba.conf)
+
+```bash
+sudo nano /etc/postgresql/16/main/pg_hba.conf
+```
+
+Dosyanın sonuna şu satırları ekle:
+
+```
+# ============================================================
+# Moodle Altyapısı Erişim Kuralları
+# ============================================================
+# Format: TYPE  DATABASE    USER        ADDRESS             METHOD
+
+# PgBouncer'ın localhost'tan bağlanmasına izin ver
+host    moodle          moodleuser  127.0.0.1/32        scram-sha-256
+host    moodle          moodleuser  ::1/128             scram-sha-256
+
+# Scalelite'ın bağlanmasına izin ver
+host    scalelite_production  scalelite  127.0.0.1/32    scram-sha-256
+
+# ⚠️ Alternatif: Tüm Moodle sunucularından direkt erişim (PgBouncer olmadan)
+# Eğer PgBouncer kullanmıyorsanız bu satırları açın:
+# host    moodle    moodleuser    192.168.1.11/32    scram-sha-256
+# host    moodle    moodleuser    192.168.1.12/32    scram-sha-256
+# ... 192.168.1.20'ye kadar
+
+# ⚠️ Eğer PgBouncer ayrı sunucudaysa, PgBouncer sunucu IP'sini ekle:
+# host    moodle    moodleuser    192.168.1.101/32    scram-sha-256
+```
+
+#### 3.3 PostgreSQL'i Yeniden Başlat
+
+```bash
+sudo systemctl restart postgresql
+
+# Servis durumunu kontrol et
+sudo systemctl status postgresql
+
+# PostgreSQL'in 5432 portunu dinleyip dinlemediğini kontrol et
+ss -tlnp | grep 5432
+# Çıktı: LISTEN 0 128 0.0.0.0:5432 şeklinde olmalı
+```
+
+---
+
+### 4️⃣ Bağlantıyı Test Et
+
+Moodle sunucularından herhangi birinde (Ör: Node-1):
+
+```bash
+# PostgreSQL istemcisi ile bağlantı testi
+psql -h 192.168.1.100 -p 5432 -U moodleuser -d moodle
+
+# Bağlantı başarılı olursa şu çıktıyı görürsünüz:
+# psql (16.x)
+# SSL connection (...)
+# moodle=>
+
+# Bir test sorgusu çalıştır
+moodle=> SELECT version();
+moodle=> \q
+```
+
+---
+
+### 5️⃣ PgBouncer Kurulumu (SQL Bağlantı Havuzlayıcı)
+
+PgBouncer, PostgreSQL ile aynı sunucuya (192.168.1.100) kurulacak ve port 6432'de dinleyecektir.
+
+#### 5.1 PgBouncer'ı Kur
+
+```bash
+# PgBouncer'ı kur
+sudo apt install -y pgbouncer
+
+# Sürümü kontrol et
+pgbouncer --version
+```
+
+#### 5.2 PgBouncer Veritabanı Tanımları
+
+```bash
+sudo nano /etc/pgbouncer/pgbouncer.ini
+```
+
+**Tüm içeriği sil ve şunları yapıştır:**
+
+```ini
+; ============================================================================
+; PgBouncer Konfigürasyonu - Moodle HA Altyapısı
+; ============================================================================
+
+[databases]
+; Moodle veritabanı - localhost'taki PostgreSQL'e yönlendir
+moodle = host=127.0.0.1 port=5432 dbname=moodle
+
+; Scalelite veritabanı
+scalelite_production = host=127.0.0.1 port=5432 dbname=scalelite_production
+
+[pgbouncer]
+; ============================================================================
+; Bağlantı Ayarları
+; ============================================================================
+; Hangi adres ve portta dinleyeceği
+listen_addr = 0.0.0.0
+listen_port = 6432
+
+; ============================================================================
+; Havuzlama Modu
+; ============================================================================
+; transaction: Her SQL transaction için bağlantı ver (Moodle için önerilen)
+; session: Kullanıcı bağlandığında bağlantı ver (daha basit ama daha az verimli)
+; statement: Her SQL cümlesi için bağlantı ver (en verimli ama kısıtlı)
+pool_mode = transaction
+
+; ============================================================================
+; Havuz Boyutları
+; ============================================================================
+; PostgreSQL'e açılacak maksimum bağlantı sayısı (veritabanı başına)
+max_client_conn = 1000     ; Moodle sunucularından gelen toplam bağlantı
+default_pool_size = 50     ; PostgreSQL'e gidecek gerçek bağlantı sayısı
+min_pool_size = 10         ; Hazırda tutulacak minimum bağlantı
+reserve_pool_size = 5      ; Yoğunluk durumunda ekstra bağlantı
+reserve_pool_timeout = 5   ; Ekstra bağlantı için bekleme süresi (saniye)
+
+; ============================================================================
+; Zaman Aşımı Ayarları
+; ============================================================================
+server_idle_timeout = 600      ; Boş bağlantı kapatma süresi (saniye)
+client_idle_timeout = 0        ; İstemci bağlantı zaman aşımı (0=kapalı)
+query_timeout = 0              ; Sorgu zaman aşımı (0=kapalı)
+client_login_timeout = 60      ; Giriş zaman aşımı (saniye)
+
+; ============================================================================
+; Kimlik Doğrulama
+; ============================================================================
+; Kullanıcı şifrelerinin saklandığı dosya
+auth_file = /etc/pgbouncer/userlist.txt
+; Kimlik doğrulama türü
+auth_type = scram-sha-256
+
+; ============================================================================
+; Yönetim
+; ============================================================================
+; PgBouncer yönetim konsoluna erişecek kullanıcılar (virgülle ayır)
+admin_users = postgres
+; İstatistikleri görebilecek kullanıcılar
+stats_users = postgres, moodleuser
+
+; ============================================================================
+; Loglama
+; ============================================================================
+logfile = /var/log/postgresql/pgbouncer.log
+pidfile = /var/run/postgresql/pgbouncer.pid
+log_connections = 0    ; Bağlantıları logla (0=kapalı, üretimde kapanmalı)
+log_disconnections = 0
+log_stats = 1          ; İstatistikleri logla (600 saniyede bir)
+stats_period = 600
+
+; ============================================================================
+; Sunucu TLS (PostgreSQL'e şifreli bağlantı - isteğe bağlı)
+; ============================================================================
+; server_tls_sslmode = prefer
+```
+
+#### 5.3 Kullanıcı Şifre Dosyası
+
+PgBouncer, PostgreSQL kullanıcılarının şifrelerini kendi dosyasında saklar:
+
+```bash
+# Moodle kullanıcısı için şifreyi PostgreSQL'den al (SCRAM formatında)
+sudo -u postgres psql -c "SELECT usename, passwd FROM pg_shadow WHERE usename='moodleuser';"
+```
+
+Çıktıdaki şifreyi kopyala ve userlist dosyasına ekle:
+
+```bash
+sudo nano /etc/pgbouncer/userlist.txt
+```
+
+```
+"moodleuser" "SCRAM-SHA-256$4096:...buraya_pg_shadow_ciktisini_yapistirin..."
+"scalelite" "SCRAM-SHA-256$4096:...buraya_scalelite_sifresini_yapistirin..."
+```
+
+**Alternatif — düz metin şifre (geliştirme ortamı için):**
+
+```bash
+# Eğer pg_shadow çıktısını kullanmak istemiyorsanız:
+# auth_type = md5 olarak değiştirip aşağıdaki formatı kullanabilirsiniz:
+"moodleuser" "VERITABANI_SIFRENIZ"
+```
+
+#### 5.4 PgBouncer'ı Başlat
+
+```bash
+# Dosya izinlerini ayarla
+sudo chown postgres:postgres /etc/pgbouncer/userlist.txt
+sudo chmod 600 /etc/pgbouncer/userlist.txt
+
+# Konfigürasyonu doğrula
+sudo -u postgres pgbouncer -d /etc/pgbouncer/pgbouncer.ini
+
+# Hata yoksa servisi başlat
+sudo systemctl restart pgbouncer
+sudo systemctl enable pgbouncer
+sudo systemctl status pgbouncer
+
+# PgBouncer'ın 6432 portunu dinleyip dinlemediğini kontrol et
+ss -tlnp | grep 6432
+# Çıktı: LISTEN 0 128 0.0.0.0:6432 şeklinde olmalı
+```
+
+---
+
+### 6️⃣ PgBouncer Bağlantısını Test Et
+
+**Node-1 üzerinde (Moodle sunucusundan):**
+
+```bash
+# PgBouncer üzerinden veritabanına bağlan
+psql -h 192.168.1.100 -p 6432 -U moodleuser -d moodle
+
+# Bağlantı başarılıysa:
+moodle=> SELECT current_database(), inet_server_addr(), inet_server_port();
+# current_database: moodle
+# inet_server_addr: 127.0.0.1
+# inet_server_port: 5432
+moodle=> \q
+```
+
+---
+
+### 7️⃣ PgBouncer İstatistik Konsolu
+
+PgBouncer'ın yerleşik yönetim konsoluna bağlanabilirsiniz:
+
+```bash
+# PgBouncer yönetim konsoluna bağlan
+psql -h 127.0.0.1 -p 6432 -U postgres pgbouncer
+```
+
+Yararlı komutlar:
+
+```sql
+-- Aktif havuz durumunu gör
+SHOW POOLS;
+
+-- Bağlantı istatistiklerini gör
+SHOW STATS;
+
+-- Veritabanı bağlantılarını gör
+SHOW DATABASES;
+
+-- Aktif istemcileri gör
+SHOW CLIENTS;
+
+-- Aktif sunucu bağlantılarını gör
+SHOW SERVERS;
+
+-- Konfigürasyonu yeniden yükle (restart gerektirmez)
+RELOAD;
+
+-- Çıkış
+QUIT;
+```
+
+Örnek `SHOW POOLS` çıktısı:
+
+```
+ database  |   user    | cl_active | cl_waiting | sv_active | sv_idle | sv_used | maxwait
+-----------+-----------+-----------+------------+-----------+---------+---------+--------
+ moodle    | moodleuser|        45 |          0 |        45 |       5 |       0 |       0
+```
+
+- `cl_active`: PgBouncer'a bağlı aktif Moodle istemcileri
+- `sv_active`: PostgreSQL'e açık aktif bağlantılar
+- `maxwait`: Bağlantı bekleyen istemci sayısı (0 olmalı, yüksekse pool_size artır)
+
+---
+
+### 8️⃣ PostgreSQL Güvenlik Duvarı Ayarları
+
+```bash
+# UFW (Ubuntu güvenlik duvarı) aktifse:
+sudo ufw allow from 192.168.1.0/24 to any port 5432   # PostgreSQL (yalnızca iç ağ)
+sudo ufw allow from 192.168.1.0/24 to any port 6432   # PgBouncer (yalnızca iç ağ)
+
+# Dışarıdan PostgreSQL/PgBouncer erişimini ENGELLE:
+sudo ufw deny 5432
+sudo ufw deny 6432
+
+# Durumu kontrol et
+sudo ufw status
+```
+
+---
+
+### 9️⃣ (Opsiyonel) PostgreSQL Streaming Replikasyonu
+
+Yüksek erişilebilirlik için bir Replica sunucu (192.168.1.101) ekleyebilirsiniz. Bu sunucu okuma sorgularını üstlenir ve Primary çökerse devreye girer.
+
+#### Primary Sunucuda (192.168.1.100):
+
+```bash
+# Replikasyon kullanıcısı oluştur
+sudo -u postgres psql
+```
+
+```sql
+CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD 'REPLIKASYON_SIFRESI';
+\q
+```
+
+```bash
+# pg_hba.conf'a replikasyon erişimi ekle
+sudo nano /etc/postgresql/16/main/pg_hba.conf
+```
+
+Şunu ekle:
+
+```
+# Replica sunucudan replikasyon bağlantısı
+host    replication     replicator    192.168.1.101/32    scram-sha-256
+```
+
+```bash
+sudo systemctl reload postgresql
+```
+
+#### Replica Sunucuda (192.168.1.101):
+
+```bash
+# PostgreSQL'i aynı şekilde kur (adım 1)
+
+# Mevcut veriyi Primary'den kopyala
+sudo systemctl stop postgresql
+sudo rm -rf /var/lib/postgresql/16/main/*
+
+sudo -u postgres pg_basebackup \
+  -h 192.168.1.100 \
+  -U replicator \
+  -D /var/lib/postgresql/16/main \
+  -P \
+  -Xs \
+  -R
+
+# -R bayrağı otomatik olarak standby.signal ve postgresql.auto.conf oluşturur
+sudo systemctl start postgresql
+
+# Replica çalışıyor mu kontrol et
+sudo -u postgres psql -c "SELECT pg_is_in_recovery();"
+# Çıktı: t (true = replica modunda)
+```
+
+#### PgBouncer'a Read Replica Ekle (Opsiyonel):
+
+```bash
+sudo nano /etc/pgbouncer/pgbouncer.ini
+```
+
+`[databases]` bölümüne ekle:
+
+```ini
+; Okuma sorguları için replica (Moodle bunu otomatik kullanmaz;
+; ilerleyen sürümler veya özel eklentilerle yönlendirilebilir)
+moodle_read = host=192.168.1.101 port=5432 dbname=moodle
+```
+
+```bash
+sudo systemctl reload pgbouncer
+```
+
+---
+
+### 🔁 Bölüm 3 Özet: Mimari
+
+```
+10x Moodle Sunucusu
+  (192.168.1.11-20)
+        │
+        │  port 6432 (PgBouncer)
+        ▼
+┌───────────────────┐
+│   PgBouncer       │  max_client_conn=1000
+│   192.168.1.100   │  default_pool_size=50
+│   :6432           │  pool_mode=transaction
+└───────────────────┘
+        │
+        │  port 5432 (PostgreSQL)
+        ▼
+┌───────────────────┐      ┌───────────────────┐
+│   PostgreSQL      │─────▶️│   PostgreSQL      │
+│   Primary         │      │   Replica         │
+│   192.168.1.100   │      │   192.168.1.101   │
+│   :5432 (R/W)     │      │   :5432 (R only)  │
+└───────────────────┘      └───────────────────┘
+```
+
+---
+
+## 📌 Bölüm 4: Scalelite ve BigBlueButton Kümesi
+
+### 1️⃣ Scalelite İçin NFS Ayarı
+
+```bash
 sudo mkdir -p /var/bigbluebutton/spool
 sudo mkdir -p /var/bigbluebutton/published
 sudo mkdir -p /var/bigbluebutton/unpublished
 
-# NFS sunucusundan bağla (NFS sunucusunuzun IP'sini yazın: Ör 192.168.1.50)
 sudo mount 192.168.1.50:/export/bbb_spool /var/bigbluebutton/spool
 sudo mount 192.168.1.50:/export/bbb_published /var/bigbluebutton/published
 sudo mount 192.168.1.50:/export/bbb_unpublished /var/bigbluebutton/unpublished
 
-# Otomatik bağlanma için fstab dosyasını güncelle
 echo "192.168.1.50:/export/bbb_spool /var/bigbluebutton/spool nfs defaults,_netdev 0 0" | sudo tee -a /etc/fstab
 echo "192.168.1.50:/export/bbb_published /var/bigbluebutton/published nfs defaults,_netdev 0 0" | sudo tee -a /etc/fstab
 echo "192.168.1.50:/export/bbb_unpublished /var/bigbluebutton/unpublished nfs defaults,_netdev 0 0" | sudo tee -a /etc/fstab
 
-# İzinleri ayarla
 sudo chmod -R 755 /var/bigbluebutton/
 ```
 
@@ -786,59 +1023,28 @@ sudo chmod -R 755 /var/bigbluebutton/
 
 ### 2️⃣ Scalelite Ortam Değişkenleri (.env)
 
-Scalelite sunucusunda `/var/www/scalelite/.env` dosyasını oluştur:
-
 ```bash
 sudo nano /var/www/scalelite/.env
 ```
 
 ```bash
-# ============================================================================
-# Scalelite Konfigürasyonu
-# ============================================================================
-
-# URL ve Kimlik Tanımlaması
 URL_HOST=scalelite.argeyazilim.tr
 SCALELITE_TAG=scalelite.argeyazilim.tr
 
-# ============================================================================
-# Güvenlik Anahtarları
-# ============================================================================
-# SECRET_KEY_BASE: Rastgele 64 karakter oluştur:
 # Komut: openssl rand -hex 32
 SECRET_KEY_BASE=BURAYA_OLUSTURULAN_64_KARAKTERLIK_ANAHTAR
-
-# LOADBALANCER_SECRET: Moodle'ın Scalelite'a bağlanacağı şifre
 LOADBALANCER_SECRET=BURAYA_MOODLE_ICIN_GUCLU_SIFRE
 
-# ============================================================================
-# Veritabanı Bağlantısı (PostgreSQL)
-# ============================================================================
-# Format: postgres://kullanici:sifre@SUNUCU_IP/veritabani_adi
-DATABASE_URL=postgres://scalelite:SIFRE@192.168.1.100/scalelite_production
+# ⚠️ PgBouncer üzerinden bağlanıyoruz (port 6432)
+DATABASE_URL=postgres://scalelite:SIFRE@192.168.1.100:6432/scalelite_production
 
-# ============================================================================
-# Oturum ve Önbellek (Redis)
-# ============================================================================
-# Format: redis://SUNUCU_IP:PORT/0
 REDIS_URL=redis://192.168.1.185:6379/0
-
-# ============================================================================
-# Ortam
-# ============================================================================
 RAILS_ENV=production
-
-# ============================================================================
-# BBB Yapılandırması (Opsiyonel)
-# ============================================================================
-BIGBLUEBUTTON_SECRET=shared_secret
 ```
 
 ---
 
-### 3️⃣ Scalelite Poller Servisi (Opsiyonel - Durumu İzlemek İçin)
-
-Scalelite'ın BigBlueButton sunucularının sağlığını kontrol etmesi için:
+### 3️⃣ Scalelite Poller Servisi
 
 ```bash
 sudo nano /etc/systemd/system/scalelite-poller.service
@@ -854,18 +1060,13 @@ Type=simple
 User=scalelite
 WorkingDirectory=/var/www/scalelite
 EnvironmentFile=/var/www/scalelite/.env
-
-# 60 saniyede bir sağlık kontrolünü çalıştır
 ExecStart=/bin/bash -c 'while true; do RAILS_ENV=production bundle exec rake poll:all; sleep 60; done'
-
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
-
-Servisi başlat:
 
 ```bash
 sudo systemctl daemon-reload
@@ -877,73 +1078,30 @@ sudo systemctl start scalelite-poller
 
 ### 4️⃣ BigBlueButton Sunucularını Scalelite'a Ekleme
 
-Her BigBlueButton sunucusu için:
-
 ```bash
-# BBB sunucusundan API gizli anahtarını al
 sudo bbb-conf --secret
-# Çıktı:
-# URL: https://bbb-node-01.example.com/bigbluebutton/api
-# Secret: 8e0a1be...
-```
+# Çıktıdaki URL ve Secret değerlerini not al
 
-Scalelite sunucusunda, BBB sunucularını havuza ekle:
-
-```bash
-# BBB Node-1'i ekle
 cd /var/www/scalelite
 RAILS_ENV=production bundle exec rake servers:add[\
 https://bbb-node-01.argeyazilim.tr/bigbluebutton/api,\
 SUNUCU_1_SECRET_KODU\
 ]
 
-# BBB Node-2'yi ekle
-RAILS_ENV=production bundle exec rake servers:add[\
-https://bbb-node-02.argeyazilim.tr/bigbluebutton/api,\
-SUNUCU_2_SECRET_KODU\
-]
-
-# Daha fazla BBB sunucusu varsa tekrar et...
-```
-
-Eklenen sunucuları listele:
-
-```bash
 RAILS_ENV=production bundle exec rake servers
-```
-
-Çıktı örneği:
-```
-1. https://bbb-node-01.argeyazilim.tr/bigbluebutton/api
-2. https://bbb-node-02.argeyazilim.tr/bigbluebutton/api
-...
-```
-
-Sunucuları aktifleştir (1, 2, 3... şeklinde ID'lerle):
-
-```bash
 RAILS_ENV=production bundle exec rake servers:enable[1]
-RAILS_ENV=production bundle exec rake servers:enable[2]
 ```
 
 ---
 
 ### 5️⃣ Moodle'da Scalelite Konfigürasyonu
 
-Herhangi bir Moodle sunucusuna yönetici hesabıyla giriş yap:
-
-1. **Site Yönetimi** → **Eklentiler** → **Eklenti Yönetimi** → **BigBlueButton** ara
-2. **Ayarlar** sekmesine tıkla
-3. Aşağıdaki bilgileri gir:
+**Site Yönetimi → Eklentiler → BigBlueButton → Ayarlar:**
 
 | Ayar | Değer |
 |------|-------|
 | **BigBlueButton Server URL** | `https://scalelite.argeyazilim.tr/bigbluebutton/api` |
-| **Shared Secret** | Scalelite `.env` dosyasındaki `LOADBALANCER_SECRET` |
-
-4. **Kaydet** butonuna tıkla
-
-Artık Moodle'dan oluşturulan her canlı ders, Scalelite tarafından analiz edilerek en uygun BBB sunucusunda başlatılır.
+| **Shared Secret** | `.env` dosyasındaki `LOADBALANCER_SECRET` |
 
 ---
 
@@ -952,62 +1110,95 @@ Artık Moodle'dan oluşturulan her canlı ders, Scalelite tarafından analiz edi
 ### 🟥 Problem 1: Moodle Sunucuları HAProxy'de DOWN Gösteriliyor
 
 ```bash
-# 1. Sunucunun çalışıp çalışmadığını kontrol et
 ping 192.168.1.11
-
-# 2. Nginx çalışıyor mu?
 ssh user@192.168.1.11 "systemctl status nginx"
-
-# 3. Sağlık kontrolünün URL'sini manuel test et
 curl http://192.168.1.11/login/index.php
-
-# 4. HAProxy loglarını kontrol et
 sudo tail -f /var/log/haproxy.log
 ```
 
 ### 🟥 Problem 2: Kullanıcılar Oturumdan Düşüyor
 
 ```bash
-# Redis bağlantısını test et
 redis-cli -h 192.168.1.185
 > ping
 # Çıktı: PONG
 
-# Moodle sunucusunun config.php'sini kontrol et
 grep -A 5 "session_redis" /var/www/moodle/config.php
 ```
 
 ### 🟥 Problem 3: Dosya Yükleme Başarısız Oluyor
 
 ```bash
-# NFS bağlantısını kontrol et
 df -h /var/moodledata
-
-# İzinleri kontrol et
 ls -ld /var/moodledata
-# Çıktı: drwxr-xr-x www-data www-data şeklinde olmalı
-
-# NFS sunucusundan test yap
-touch /var/moodledata/test.txt
-rm /var/moodledata/test.txt
+touch /var/moodledata/test.txt && rm /var/moodledata/test.txt
 ```
 
 ### 🟥 Problem 4: SSL Sertifikası Hatası
 
 ```bash
-# Sertifikanın geçerlilik tarihini kontrol et
-openssl x509 -in /etc/haproxy/certs/moodle.argeyazilim.tr.pem \
-  -noout -dates
-
-# Let's Encrypt sertifikasını yenile
+openssl x509 -in /etc/haproxy/certs/moodle.argeyazilim.tr.pem -noout -dates
 sudo certbot renew --dry-run
-
-# HAProxy'ye yeni sertifikayı sağla
-sudo bash -c 'cat /etc/letsencrypt/live/moodle.argeyazilim.tr/fullchain.pem \
-  /etc/letsencrypt/live/moodle.argeyazilim.tr/privkey.pem > \
-  /etc/haproxy/certs/moodle.argeyazilim.tr.pem'
-
 sudo systemctl restart haproxy
+```
+
+### 🟥 Problem 5: PostgreSQL Bağlantı Hatası
+
+```bash
+# PostgreSQL çalışıyor mu?
+sudo systemctl status postgresql
+
+# PostgreSQL loglarını kontrol et
+sudo tail -50 /var/log/postgresql/postgresql-16-main.log
+
+# Uzaktan bağlantı testi
+psql -h 192.168.1.100 -p 5432 -U moodleuser -d moodle -c "SELECT 1;"
+
+# pg_hba.conf ayarlarını kontrol et
+sudo grep -v "^#" /etc/postgresql/16/main/pg_hba.conf | grep -v "^$"
+```
+
+### 🟥 Problem 6: PgBouncer Bağlantı Hatası
+
+```bash
+# PgBouncer çalışıyor mu?
+sudo systemctl status pgbouncer
+
+# PgBouncer loglarını kontrol et
+sudo tail -50 /var/log/postgresql/pgbouncer.log
+
+# PgBouncer portunu kontrol et
+ss -tlnp | grep 6432
+
+# Bağlantı testi
+psql -h 192.168.1.100 -p 6432 -U moodleuser -d moodle -c "SELECT 1;"
+
+# Havuz durumunu kontrol et
+psql -h 127.0.0.1 -p 6432 -U postgres pgbouncer -c "SHOW POOLS;"
+
+# Konfigürasyonu yeniden yükle (restart gerektirmez)
+psql -h 127.0.0.1 -p 6432 -U postgres pgbouncer -c "RELOAD;"
+```
+
+### 🟥 Problem 7: PgBouncer "prepared statement" Hatası
+
+Moodle bazı sürümlerde prepared statement kullanır. Transaction pool modu bununla uyumsuz olabilir:
+
+```bash
+sudo nano /etc/pgbouncer/pgbouncer.ini
+```
+
+```ini
+; transaction yerine session moduna geç (daha az verimli ama uyumlu)
+pool_mode = session
+
+; Veya prepared statement'ları devre dışı bırak (PHP PDO için):
+; Moodle config.php'ye şunu ekle:
+; $CFG->dboptions = ['options' => '--disable_prepared_transactions=1'];
+```
+
+```bash
+sudo systemctl restart pgbouncer
 ```
 
 ---
@@ -1017,24 +1208,13 @@ sudo systemctl restart haproxy
 - [Moodle Resmi Dokümantasyonu](https://docs.moodle.org)
 - [Moodle Küme Kurulumu](https://docs.moodle.org/en/Setting_up_a_cluster)
 - [HAProxy Dokümantasyonu](http://www.haproxy.org/)
-- [BigBlueButton](https://docs.bigbluebutton.org/)
-- [Scalelite](https://github.com/blindsidenetworks/scalelite)
 - [PostgreSQL Dokümantasyonu](https://www.postgresql.org/docs/)
+- [PgBouncer Dokümantasyonu](https://www.pgbouncer.org/config.html)
+- [BigBlueButton Dokümantasyonu](https://docs.bigbluebutton.org/)
+- [Scalelite GitHub](https://github.com/blindsidenetworks/scalelite)
 - [Redis Dokümantasyonu](https://redis.io/documentation)
 
 ---
 
-## 💬 Katkıda Bulunma
-
-Bu rehbere katkıda bulunmak istiyorsanız, lütfen [GitHub Issues](https://github.com) üzerinden feedback veya pull request gönderin.
-
----
-
-## 📄 Lisans
-
-Bu dokümantasyon Creative Commons Attribution 4.0 International License altında yayımlanmıştır.
-
----
-
-**Son Güncelleme:** Haziran 2026
-**Versiyon:** 2.0 (Geliştirilmiş ve Açıklanmış Sürüm)
+**Son Güncelleme:** Haziran 2026  
+**Versiyon:** 3.0 (PostgreSQL + PgBouncer Eklendi)
