@@ -9,8 +9,9 @@ Binlerce öğrenciye aynı anda hizmet verebilmek için tasarlanmış, **Yüksek
 2. [Bölüm 1: Moodle Uygulama Sunucularının Kurulumu](#bölüm-1-moodle-uygulama-sunucularının-kurulumu)
 3. [Bölüm 2: HAProxy ile Yük Dengeleme](#bölüm-2-haproxy-ile-yük-dengeleme)
 4. [Bölüm 3: PostgreSQL Kurulumu ve PgBouncer ile SQL Yük Dengeleme](#bölüm-3-postgresql-kurulumu-ve-pgbouncer-ile-sql-yük-dengeleme)
-5. [Bölüm 4: Scalelite ve BigBlueButton Kümesi](#bölüm-4-scalelite-ve-bigbluebutton-kümesi)
-6. [Sorun Giderme İpuçları](#sorun-giderme-ipuçları)
+5. [Bölüm 4: Ortak Depolama Katmanı (NFS Server ve İzin Yönetimi)](https://www.google.com/search?q=%23b%C3%B6l%C3%BCm-4-ortak-depolama-katman%C4%B1-nfs-server-ve-izin-y%C3%B6netimi)
+6. [Bölüm 5: Scalelite ve BigBlueButton Kümesi](https://www.google.com/search?q=%23b%C3%B6l%C3%BCm-5-scalelite-ve-bigbluebutton-k%C3%BCmesi)
+7. [Sorun Giderme İpuçları](https://www.google.com/search?q=%23sorun-giderme-ipu%C3%A7lar%C4%B1)
 
 ---
 
